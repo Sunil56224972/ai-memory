@@ -878,12 +878,33 @@ async fn build_backup_tarball_file(state: &AdminState) -> anyhow::Result<tokio::
         tar.mode(tar::HeaderMode::Deterministic);
         tar.follow_symlinks(false);
 
+        // Validate before AND after archival to close the TOCTOU window.
+        //
+        // `append_dir_all` with `follow_symlinks(false)` records symlinks
+        // as tar entries instead of following them, so a symlink injected
+        // between the pre-validation and the walk does not exfiltrate
+        // file content from the host.  However, those symlink entries
+        // survive in the archive and point wherever the attacker chose;
+        // restoring such a backup on another machine creates live
+        // symlinks, a variant of the classic "zip-slip" attack.
+        //
+        // The post-archive re-validation catches any symlink that
+        // appeared in the window: if the tree is no longer clean the
+        // already-written tarball is discarded before it reaches the
+        // response stream.
         ai_memory_wiki::validate_wiki_tree(&wiki_dir)
             .map_err(|error| anyhow::anyhow!("validating wiki tree before archive: {error}"))?;
         if wiki_dir.is_dir() {
             tar.append_dir_all("wiki", &wiki_dir)
                 .map_err(|e| anyhow::anyhow!("archiving wiki/: {e}"))?;
         }
+        // Post-archive validation: reject the backup if a symlink was
+        // planted between the pre-check and the archive walk.
+        ai_memory_wiki::validate_wiki_tree(&wiki_dir).map_err(|error| {
+            anyhow::anyhow!(
+                "wiki tree modified during archive (possible symlink injection): {error}"
+            )
+        })?;
 
         tar.append_path_with_name(&snapshot_path, "db/memory.sqlite")
             .map_err(|e| anyhow::anyhow!("archiving db snapshot: {e}"))?;

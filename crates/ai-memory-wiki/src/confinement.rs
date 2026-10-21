@@ -230,10 +230,9 @@ pub(crate) fn inspect_tree_except(root: &Path, excluded_roots: &[&Path]) -> Wiki
             // every entry that IS stat-able must pass the link-like check
             // below.
             // lgtm [rust/path-injection]
-            let metadata = match std::fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error) if is_transient_churn(&error) => continue,
-                Err(error) => return Err(error.into()),
+            let metadata = match stat_or_skip(&path)? {
+                Some(metadata) => metadata,
+                None => continue,
             };
             if is_link_like(&metadata) {
                 return Err(confined(&path));
@@ -264,24 +263,78 @@ pub(crate) fn is_link_like(metadata: &std::fs::Metadata) -> bool {
     }
 }
 
-/// Whether a walk-probe error is concurrent-writer churn rather than a
-/// verdict about the tree.
+// Windows raw error codes used by the churn helpers below.
+const ERROR_ACCESS_DENIED: i32 = 5;
+const ERROR_SHARING_VIOLATION: i32 = 32;
+const ERROR_DELETE_PENDING: i32 = 303;
+
+/// Whether a directory-iteration error is concurrent-writer churn rather
+/// than a verdict about the tree.
 ///
-/// Windows rename semantics give the vanish race a second shape: the
-/// atomic writer rename-replaces files and a concurrent commit holds
-/// `.git` lock and temp files, so a stat on an already-listed entry can
-/// fail with a sharing violation (`PermissionDenied`) or
-/// `ERROR_DELETE_PENDING` for a path that exists again — or does not —
-/// an instant later. Like NotFound, neither says anything stable enough
-/// to act on, so the walk skips the entry; any entry that does stat
-/// still faces the link-like refusal.
+/// During `read_dir` iteration, concurrent commits and atomic writers
+/// can cause entries to vanish or become temporarily inaccessible.  On
+/// Windows this surfaces as `NotFound`, `ERROR_SHARING_VIOLATION` (32),
+/// `ERROR_ACCESS_DENIED` (5), or `ERROR_DELETE_PENDING` (303).  All
+/// four are accepted here because the entry was never individually
+/// stat-checked — the iteration merely failed to yield it.
 fn is_transient_churn(error: &std::io::Error) -> bool {
-    // ERROR_DELETE_PENDING: std maps sharing violations to
-    // PermissionDenied but leaves this one an unmapped raw code.
-    const ERROR_DELETE_PENDING: i32 = 303;
     error.kind() == std::io::ErrorKind::NotFound
-        || error.kind() == std::io::ErrorKind::PermissionDenied
+        || error.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
+        || error.raw_os_error() == Some(ERROR_ACCESS_DENIED)
         || error.raw_os_error() == Some(ERROR_DELETE_PENDING)
+}
+
+/// Whether a `symlink_metadata` error on an already-listed entry is
+/// concurrent-writer churn rather than a verdict about that entry.
+///
+/// This is stricter than [`is_transient_churn`]: it does **not** accept
+/// `ERROR_ACCESS_DENIED` (code 5).  A sharing violation or
+/// delete-pending status means the entry is mid-replacement and will
+/// reappear (or not) an instant later — safe to skip.  But
+/// `ERROR_ACCESS_DENIED` can also mean restrictive ACLs that
+/// permanently prevent reading metadata; silently skipping such an
+/// entry would let a symlink / reparse point evade the link-like check.
+fn is_stat_churn(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        || error.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
+        || error.raw_os_error() == Some(ERROR_DELETE_PENDING)
+}
+
+/// Retry `symlink_metadata` up to a small number of times when
+/// `ERROR_ACCESS_DENIED` is returned, to distinguish transient
+/// churn (the entry vanishes on retry → safe to skip) from
+/// persistent ACL-based hiding (the entry stays inaccessible →
+/// must be treated as an error).
+fn stat_or_skip(path: &std::path::Path) -> Result<Option<std::fs::Metadata>, WikiError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => return Ok(Some(m)),
+        Err(e) if is_stat_churn(&e) => return Ok(None),
+        Err(e) if e.raw_os_error() != Some(ERROR_ACCESS_DENIED) => return Err(e.into()),
+        Err(_) => { /* ACCESS_DENIED — retry below */ }
+    }
+    // The first attempt got ACCESS_DENIED.  Genuine writer churn
+    // resolves within microseconds; a persistent ACL does not.
+    // Retry a few times with a tiny sleep to let any in-flight
+    // rename complete.
+    for _ in 0..3 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        match std::fs::symlink_metadata(path) {
+            Ok(m) => return Ok(Some(m)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if is_stat_churn(&e) => return Ok(None),
+            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    // Still ACCESS_DENIED after retries — treat as a genuine
+    // permission error rather than silently skipping the entry.
+    Err(WikiError::Io(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "persistent access denied on wiki entry (possible ACL-hidden symlink): {}",
+            path.display()
+        ),
+    )))
 }
 
 fn inspect_root(root: &Path) -> WikiResult<()> {
